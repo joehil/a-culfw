@@ -20,6 +20,7 @@
  * Free Software Foundation, Inc., 
  * 51 Franklin St, Fifth Floor, Boston, MA 02110, USA
  *
+ * joehil 2017-06-16: Modification to report all TCM97001 packages
  */
 #include <avr/interrupt.h>              // for ISR
 #include <avr/pgmspace.h>               // for PSTR
@@ -52,17 +53,16 @@
 #ifdef HAS_MBUS
 #include "rf_mbus.h"                    // for WMBUS_NONE, mbus_mode
 #endif
-#include "rf_mode.h"
-#include "multi_CC.h"
 
-#ifdef USE_HAL
-#include "hal.h"
+#ifdef SAM7
+#include <hal_gpio.h>
+#include <hal_timer.h>
+#elif defined STM32
+#include <hal_gpio.h>
+#include <hal_timer.h>
+
+#include "stm32f1xx_it.h"
 #endif
-
-#ifndef USE_RF_MODE
-uint8_t tx_report;              // global verbose / output-filter
-#endif
-
 //////////////////////////
 // With a CUL measured RF timings, in us, high/low sum
 //           Bit zero        Bit one
@@ -79,16 +79,19 @@ uint8_t tx_report;              // global verbose / output-filter
 #define STATE_SYNC    2
 #define STATE_COLLECT 3
 
+
+uint8_t tx_report;              // global verbose / output-filter
+
 static uint8_t obuf[MAXMSG]; // parity-stripped output
 
-static bucket_t bucket_array[NUM_SLOWRF][RCV_BUCKETS];
-static uint8_t bucket_in[NUM_SLOWRF];                 // Pointer to the in(terrupt) queue
-static uint8_t bucket_out[NUM_SLOWRF];                // Pointer to the out (analyze) queue
-static uint8_t bucket_nrused[NUM_SLOWRF];             // Number of unprocessed buckets
+static bucket_t bucket_array[RCV_BUCKETS];
+static uint8_t bucket_in;                 // Pointer to the in(terrupt) queue
+static uint8_t bucket_out;                // Pointer to the out (analyze) queue
+static uint8_t bucket_nrused;             // Number of unprocessed buckets
 static uint8_t nibble; // parity-stripped output
 static uint8_t roby, robuf[MAXMSG];       // for Repeat check: buffer and time
-static uint32_t reptime[NUM_SLOWRF];
-static uint16_t maxLevel[NUM_SLOWRF];
+static uint32_t reptime;
+static uint16_t maxLevel;
 
 
 static void delbit(bucket_t *b);
@@ -96,24 +99,15 @@ static void delbit(bucket_t *b);
 uint8_t wave_equals(wave_t *a, uint8_t htime, uint8_t ltime, uint8_t state);
 
 
-static pulse_t hightime[NUM_SLOWRF], lowtime[NUM_SLOWRF];
+static pulse_t hightime, lowtime;
 
 void
 tx_init(void)
 {
-#ifdef USE_RF_MODE
-  init_RF_mode();
-#endif
 
-#ifdef USE_HAL
-#ifdef HAS_MULTI_CC
-  for(uint8_t x=0; x < HAS_MULTI_CC; x++) {
-    hal_CC_GDO_init(x,INIT_MODE_OUT_CS_IN);
-  }
-#else
+#ifdef ARM
   hal_CC_GDO_init(0,INIT_MODE_OUT_CS_IN);
-#endif
-
+  //hal_enable_CC_GDOin_int(0,TRUE);
 #else
   SET_BIT  ( CC1100_OUT_DDR,  CC1100_OUT_PIN);
   CLEAR_BIT( CC1100_OUT_PORT, CC1100_OUT_PIN);
@@ -125,10 +119,8 @@ tx_init(void)
   credit_10ms = MAX_CREDIT/2;
 
   for(int i = 1; i < RCV_BUCKETS; i ++)
-    bucket_array[CC_INSTANCE][i].state = STATE_RESET;
-#ifndef USE_RF_MODE
+    bucket_array[i].state = STATE_RESET;
   cc_on = 0;
-#endif
 }
 
 void
@@ -142,13 +134,9 @@ set_txrestore()
     return;
   }
 #endif
-
-  if(TX_REPORT) {
+  if(tx_report) {
     set_ccon();
-#ifdef HAS_MULTI_CC
-    if(CC1101.instance < NUM_SLOWRF)
-#endif
-      ccRX();
+    ccRX();
 
   } else {
     set_ccoff();
@@ -160,20 +148,14 @@ void
 set_txreport(char *in)
 {
   if(in[1] == 0) {              // Report Value
-    MULTICC_PREFIX();
-    DH2(TX_REPORT);
+    DH2(tx_report);
     DU(credit_10ms, 5);
     DNL();
     return;
   }
 
-  fromhex(in+1, &TX_REPORT, 1);
-
-#ifdef USE_RF_MODE
-  set_RF_mode(RF_mode_slow);
-#else
+  fromhex(in+1, &tx_report, 1);
   set_txrestore();
-#endif
 }
 
 ////////////////////////////////////////////////////
@@ -337,11 +319,11 @@ RfAnalyze_Task(void)
   bucket_t *b;
   uint8_t oby = 0;
 
-  if(lowtime[CC_INSTANCE]) {
+  if(lowtime) {
 #ifndef NO_RF_DEBUG
-    if(TX_REPORT & REP_LCDMON) {
+    if(tx_report & REP_LCDMON) {
 #ifdef HAS_LCD
-      lcd_txmon(hightime[CC_INSTANCE], lowtime[CC_INSTANCE]);
+      lcd_txmon(hightime, lowtime);
 #else
       uint8_t rssi = cc1100_readReg(CC1100_RSSI);    //  0..256
       rssi = (rssi >= 128 ? rssi-128 : rssi+128);    // Swap
@@ -351,25 +333,24 @@ RfAnalyze_Task(void)
         rssi = 15;
       else 
         rssi = (rssi-80)>>3;
-      MULTICC_PREFIX();
       DC('a'+rssi);
 #endif
     }
-    if(TX_REPORT & REP_MONITOR) {
-      DC('r'); if(TX_REPORT & REP_BINTIME) DC(hightime[CC_INSTANCE]);
-      DC('f'); if(TX_REPORT & REP_BINTIME) DC(lowtime[CC_INSTANCE]);
+    if(tx_report & REP_MONITOR) {
+      DC('r'); if(tx_report & REP_BINTIME) DC(hightime);
+      DC('f'); if(tx_report & REP_BINTIME) DC(lowtime);
     }
 #endif // NO_RF_DEBUG
-    lowtime[CC_INSTANCE] = 0;
+    lowtime = 0;
   }
 
 
-  if(bucket_nrused[CC_INSTANCE] == 0)
+  if(bucket_nrused == 0)
     return;
 
   LED_ON();
 
-  b = bucket_array[CC_INSTANCE] + bucket_out[CC_INSTANCE];
+  b = bucket_array + bucket_out;
 
 #ifdef HAS_IT
   analyze_intertechno(b, &datatype, obuf, &oby);
@@ -431,7 +412,7 @@ RfAnalyze_Task(void)
 
     if(!datatype) {
       // As there is no last rise, we have to add the last bit by hand
-      addbit(b, wave_equals(&b->one, hightime[CC_INSTANCE], b->one.lowtime, b->state));
+      addbit(b, wave_equals(&b->one, hightime, b->one.lowtime, b->state));
       if(analyze(b, TYPE_KS300, &oby)) {
         oby--;                                 
         if(cksum3(obuf, oby) == obuf[oby-nibble])
@@ -447,19 +428,19 @@ RfAnalyze_Task(void)
     if(IS868MHZ && !datatype && b->byteidx == 4 && b->bitidx == 4 &&
        wave_equals(&b->zero, TSCALE(960), TSCALE(480), b->state)) {
 
-      addbit(b, wave_equals(&b->one, hightime[CC_INSTANCE], TSCALE(480), b->state));
+      addbit(b, wave_equals(&b->one, hightime, TSCALE(480), b->state));
       for(oby=0; oby < 5; oby++)
         obuf[oby] = b->data[oby];
       datatype = TYPE_HRM;
     }
 #endif
 
-  if(datatype && (TX_REPORT & REP_KNOWN)) {
+  if(datatype && (tx_report & REP_KNOWN)) {
 
     packetCheckValues.isrep = 0;
     packetCheckValues.packageOK = 0;
     //packetCheckValues.isnotrep = 0;
-    if(!(TX_REPORT & REP_REPEATED)) {      // Filter repeated messages
+    if(!(tx_report & REP_REPEATED)) {      // Filter repeated messages
       
       // compare the data
       if(roby == oby) {
@@ -468,18 +449,18 @@ RfAnalyze_Task(void)
             packetCheckValues.isnotrep = 0;
             break;
           }
-        if(roby == oby && (ticks - reptime[CC_INSTANCE] < REPTIME)) // 38/125 = 0.3 sec
+        if(roby == oby && (ticks - reptime < REPTIME)) // 38/125 = 0.3 sec
           packetCheckValues.isrep = 1;
       }
 
       // save the data
       for(roby = 0; roby < oby; roby++)
         robuf[roby] = obuf[roby];
-      reptime[CC_INSTANCE] = ticks;
+      reptime = ticks;
 
     }
 
-    if(datatype == TYPE_FHT && !(TX_REPORT & REP_FHTPROTO) &&
+    if(datatype == TYPE_FHT && !(tx_report & REP_FHTPROTO) &&
        oby > 4 &&
        (obuf[2] == FHT_ACK        || obuf[2] == FHT_ACK2    ||
         obuf[2] == FHT_CAN_XMIT   || obuf[2] == FHT_CAN_RCV ||
@@ -489,13 +470,17 @@ RfAnalyze_Task(void)
 
     checkForRepeatedPackage(&datatype, b);
 
+#if defined(HAS_IT) || defined(HAS_TCM97001)
+    if(datatype == TYPE_TCM97001) 
+    	packetCheckValues.packageOK = 1;
+#endif
+
 #if defined(HAS_RF_ROUTER) && defined(HAS_FHT_80b)
     if(datatype == TYPE_FHT && rf_router_target && !fht_hc0) // Forum #50756
       packetCheckValues.packageOK = 0;
 #endif
 
     if(packetCheckValues.packageOK) {
-      MULTICC_PREFIX();
       DC(datatype);
 #ifdef HAS_HOMEEASY
       if (b->state == STATE_HE) {
@@ -513,7 +498,7 @@ RfAnalyze_Task(void)
         DH2(obuf[i]);
       if(nibble)
         DH(obuf[oby]&0xf,1);
-      if(TX_REPORT & REP_RSSI)
+      if(tx_report & REP_RSSI)
         DH2(cc1100_readReg(CC1100_RSSI));
 #if defined(HAS_TCM97001)
         if (b->state == STATE_TCM97001) {
@@ -530,8 +515,8 @@ RfAnalyze_Task(void)
   }
 
 #ifndef NO_RF_DEBUG
-  if(TX_REPORT & REP_BITS) {
-    MULTICC_PREFIX();
+  if(tx_report & REP_BITS) {
+
     DC('p');
     DU(b->state,        2);
     DU(b->zero.hightime*16, 5);
@@ -553,7 +538,7 @@ RfAnalyze_Task(void)
 #endif
     DU(b->clockTime  *16, 5);
     DC(' ');
-    if(TX_REPORT & REP_RSSI) {
+    if(tx_report & REP_RSSI) {
       DH2(cc1100_readReg(CC1100_RSSI));
       DC(' ');
     }
@@ -569,12 +554,12 @@ RfAnalyze_Task(void)
 
   b->state = STATE_RESET;
   b->valCount = 0;
-  maxLevel[CC_INSTANCE]=0;
+  maxLevel=0;
   
-  bucket_nrused[CC_INSTANCE]--;
-  bucket_out[CC_INSTANCE]++;
-  if(bucket_out[CC_INSTANCE] == RCV_BUCKETS)
-    bucket_out[CC_INSTANCE] = 0;
+  bucket_nrused--;
+  bucket_out++;
+  if(bucket_out == RCV_BUCKETS)
+    bucket_out = 0;
 
   LED_OFF();
 
@@ -587,20 +572,20 @@ RfAnalyze_Task(void)
 
 void reset_input(void)
 {
-  maxLevel[CC_INSTANCE]=0;
-#ifdef USE_HAL
-  hal_enable_CC_timer_int(CC_INSTANCE,FALSE);
+  maxLevel=0;
+#ifdef ARM
+  hal_enable_CC_timer_int(FALSE);
 #else
   TIMSK1 = 0;
 #endif
-  bucket_array[CC_INSTANCE][bucket_in[CC_INSTANCE]].state = STATE_RESET;
+  bucket_array[bucket_in].state = STATE_RESET;
 #if defined (HAS_IT) || defined (HAS_TCM97001)
   packetCheckValues.isnotrep = 0;
 #endif
 #ifdef SAM7
-        HAL_timer_set_reload_register(CC_INSTANCE,0);
+        HAL_TIMER_SET_RELOAD_REGISTER(0);
 #elif defined STM32
-      	HAL_timer_set_reload_register(CC_INSTANCE,0xffff);
+      	HAL_TIMER_SET_RELOAD_REGISTER(0xffff);
 #else
         OCR1A = 0;
 #endif
@@ -609,7 +594,7 @@ void reset_input(void)
 //////////////////////////////////////////////////////////////////////
 // Timer Compare Interrupt Handler. If we are called, then there was no
 // data for SILENCE time, and we can put the data to be analysed
-#ifdef USE_HAL
+#ifdef ARM
 void rf_receive_TimerElapsedCallback() {
 #else
 ISR(TIMER1_COMPA_vect)
@@ -620,19 +605,16 @@ ISR(TIMER1_COMPA_vect)
 #endif
 
 #ifdef SAM7
-  hal_enable_CC_timer_int(CC_INSTANCE,FALSE);       //Disable Interrupt
+  hal_enable_CC_timer_int(FALSE);       //Disable Interrupt
 
   #ifdef LONG_PULSE
-  HAL_timer_set_reload_register(CC_INSTANCE,TWRAP/8*3);    // Wrap Timer
+  HAL_TIMER_SET_RELOAD_REGISTER(TWRAP/8*3);    // Wrap Timer
   #endif
 
 #elif defined STM32
-  hal_enable_CC_timer_int(CC_INSTANCE,FALSE);       //Disable Interrupt
-
+  hal_enable_CC_timer_int(FALSE);       //Disable Interrupt
   #ifdef LONG_PULSE
-  uint32_t tmp = HAL_timer_get_reload_register(CC_INSTANCE);
-  HAL_timer_set_reload_register(CC_INSTANCE,TWRAP);
-  HAL_timer_set_counter_value(CC_INSTANCE,tmp);
+  HAL_TIMER_SET_RELOAD_REGISTER(TWRAP);
   #endif
 
 #else
@@ -644,21 +626,21 @@ ISR(TIMER1_COMPA_vect)
 #endif
 #endif
 #ifndef NO_RF_DEBUG
-  if(TX_REPORT & REP_MONITOR)
+  if(tx_report & REP_MONITOR)
     DC('.');
 #endif
 
-  if(bucket_array[CC_INSTANCE][bucket_in[CC_INSTANCE]].state < STATE_COLLECT ||
-     bucket_array[CC_INSTANCE][bucket_in[CC_INSTANCE]].byteidx < 2) {    // false alarm
+  if(bucket_array[bucket_in].state < STATE_COLLECT ||
+     bucket_array[bucket_in].byteidx < 2) {    // false alarm
     reset_input();
     return;
 
   }
 
-  if(bucket_nrused[CC_INSTANCE]+1 == RCV_BUCKETS) {   // each bucket is full: reuse the last
+  if(bucket_nrused+1 == RCV_BUCKETS) {   // each bucket is full: reuse the last
 
 #ifndef NO_RF_DEBUG
-    if(TX_REPORT & REP_BITS)
+    if(tx_report & REP_BITS)
       DS_P(PSTR("BOVF\r\n"));            // Bucket overflow
 #endif
 
@@ -666,10 +648,10 @@ ISR(TIMER1_COMPA_vect)
 
   } else {
 
-    bucket_nrused[CC_INSTANCE]++;
-    bucket_in[CC_INSTANCE]++;
-    if(bucket_in[CC_INSTANCE] == RCV_BUCKETS)
-      bucket_in[CC_INSTANCE] = 0;
+    bucket_nrused++;
+    bucket_in++;
+    if(bucket_in == RCV_BUCKETS)
+      bucket_in = 0;
 
   }
 
@@ -736,28 +718,28 @@ delbit(bucket_t *b)
  */
 static void calcOcrValue(bucket_t *b, pulse_t *hightime, pulse_t *lowtime, bool syncHighTime) {
   if (b->valCount < 8) {
-    if (maxLevel[CC_INSTANCE]<*hightime) {
-      maxLevel[CC_INSTANCE] = *hightime;
+    if (maxLevel<*hightime) {
+      maxLevel = *hightime; 
     } 
-    if (maxLevel[CC_INSTANCE]<*lowtime) {
-      maxLevel[CC_INSTANCE] = *lowtime;
+    if (maxLevel<*lowtime) {
+      maxLevel = *lowtime;
     }
-    if (b->valCount == 7 && maxLevel[CC_INSTANCE] != 0) {
+    if (b->valCount == 7 && maxLevel != 0) {
 #ifdef SAM7
         uint32_t ocrVal = 0;
 #else
         uint16_t ocrVal = 0;
 #endif
         if (syncHighTime) {    
-          ocrVal = (((b->syncbit.hightime - maxLevel[CC_INSTANCE])>>2)+maxLevel[CC_INSTANCE]);
+          ocrVal = (((b->syncbit.hightime - maxLevel)>>2)+maxLevel);
         } else {
-          ocrVal = (((b->syncbit.lowtime - maxLevel[CC_INSTANCE])>>2)+maxLevel[CC_INSTANCE]);
+          ocrVal = (((b->syncbit.lowtime - maxLevel)>>2)+maxLevel);
         }    
 #ifdef SAM7
         ocrVal = ((ocrVal * 100) / 266);
-        HAL_timer_set_reload_register(CC_INSTANCE,ocrVal * 16);
+        HAL_TIMER_SET_RELOAD_REGISTER(ocrVal * 16);
 #elif defined STM32
-        HAL_timer_set_reload_register(CC_INSTANCE,ocrVal * 16);
+        HAL_TIMER_SET_RELOAD_REGISTER(ocrVal * 16);
 #else
         OCR1A = ocrVal * 16;
 #endif
@@ -773,26 +755,19 @@ static void calcOcrValue(bucket_t *b, pulse_t *hightime, pulse_t *lowtime, bool 
 
 //////////////////////////////////////////////////////////////////////
 // "Edge-Detected" Interrupt Handler
-#ifdef USE_HAL
+#ifdef ARM
 	void CC1100_in_callback() {
 #else
 ISR(CC1100_INTVECT)
 {
 #endif
-
 #ifdef HAS_FASTRF
-#ifdef USE_RF_MODE
-  if(is_RF_mode(RF_mode_fast)) {
-    fastrf_on = 2;
-    return;
-  }
-#else
   if(fastrf_on) {
     fastrf_on = 2;
     return;
   }
 #endif
-#endif
+
 #ifdef HAS_RF_ROUTER
   if(rf_router_status == RF_ROUTER_DATA_WAIT) {
     rf_router_status = RF_ROUTER_GOT_DATA;
@@ -801,17 +776,17 @@ ISR(CC1100_INTVECT)
 #endif
 #ifdef LONG_PULSE
   #ifdef SAM7
-  uint16_t c = HAL_timer_get_counter_value(CC_INSTANCE) / 6;   // catch the time and make it smaller
+  uint16_t c = HAL_TIMER_GET_COUNTER_VALUE() / 6;   // catch the time and make it smaller
   #elif defined STM32
-  uint16_t c = HAL_timer_get_counter_value(CC_INSTANCE)>>4;;
+  uint16_t c = HAL_TIMER_GET_COUNTER_VALUE()>>4;;
   #else
   uint16_t c = (TCNT1>>4);               // catch the time and make it smaller
   #endif
 #else
   #ifdef SAM7
-  uint8_t c = HAL_timer_get_counter_value(CC_INSTANCE) / 6;   // catch the time and make it smaller
+  uint8_t c = HAL_TIMER_GET_COUNTER_VALUE() / 6;   // catch the time and make it smaller
   #elif defined STM32
-  uint8_t c = HAL_timer_get_counter_value(CC_INSTANCE)>>4;
+  uint8_t c = HAL_TIMER_GET_COUNTER_VALUE()>>4;
   #else
   uint8_t c = (TCNT1>>4);               // catch the time and make it smaller
   #endif
@@ -821,7 +796,7 @@ ISR(CC1100_INTVECT)
 //  if(c)
 //    LED_TOGGLE();
 
-  bucket_t *b = bucket_array[CC_INSTANCE]+bucket_in[CC_INSTANCE]; // where to fill in the bit
+  bucket_t *b = bucket_array+bucket_in; // where to fill in the bit
 
 #ifdef HAS_HMS
   if (IS868MHZ && b->state == STATE_HMS) {
@@ -847,8 +822,8 @@ ISR(CC1100_INTVECT)
 
   //////////////////
   // Falling edge
-#ifdef USE_HAL
-  if (!hal_CC_Pin_Get(CC_INSTANCE,CC_Pin_In)) {
+#ifdef ARM
+  if (!hal_CC_Pin_Get(0,CC_Pin_In)) {
 #else
   if(!bit_is_set(CC1100_IN_PORT,CC1100_IN_PIN)) {
 #endif
@@ -866,33 +841,33 @@ ISR(CC1100_INTVECT)
 #endif
     )) {
       addbit(b, 1);
-#ifdef USE_HAL
-      HAL_timer_reset_counter_value(CC_INSTANCE);
+#ifdef ARM
+      HAL_TIMER_RESET_COUNTER_VALUE();
 #else
       TCNT1 = 0;
 #endif
     }
 #endif
     
-    hightime[CC_INSTANCE] = c;
+    hightime = c;
 
 #ifdef HAS_MANCHESTER
     if (b->state == STATE_MC) {
-        if (hightime[CC_INSTANCE] < (b->clockTime >> 1) || hightime[CC_INSTANCE] > (b->clockTime << 1) + b->clockTime) { // read as: duration < 0.5 * clockTime || duration > 3 * clockTime
+        if (hightime < (b->clockTime >> 1) || hightime > (b->clockTime << 1) + b->clockTime) { // read as: duration < 0.5 * clockTime || duration > 3 * clockTime
 	  // Fail. Abort.
 	  b->state = STATE_SYNC;
 	  //DC('f');
 	  return;
 	}
-        if (hightime[CC_INSTANCE]+(b->clockTime) > ((b->zero.hightime+b->one.hightime)>>1)) {
-            b->one.hightime = makeavg(b->one.hightime,hightime[CC_INSTANCE]);
-            if (b->clockTime>hightime[CC_INSTANCE]-10 && b->clockTime<hightime[CC_INSTANCE]+10) {
+        if (hightime+(b->clockTime) > ((b->zero.hightime+b->one.hightime)>>1)) {
+            b->one.hightime = makeavg(b->one.hightime,hightime);
+            if (b->clockTime>hightime-10 && b->clockTime<hightime+10) {
                 count_half+=1;
             } else {
                 count_half+=2;
             }
         } else {
-          b->zero.hightime = makeavg(b->zero.hightime,hightime[CC_INSTANCE]);
+          b->zero.hightime = makeavg(b->zero.hightime,hightime);
           count_half+=1;
         }
         if (count_half&1) { // ungerade
@@ -905,10 +880,10 @@ ISR(CC1100_INTVECT)
     return;
   }
 
-  lowtime[CC_INSTANCE] = c-hightime[CC_INSTANCE];
+  lowtime = c-hightime;
 
-#ifdef USE_HAL
-  HAL_timer_reset_counter_value(CC_INSTANCE);
+#ifdef ARM
+  HAL_TIMER_RESET_COUNTER_VALUE();
 #else
   TCNT1 = 0;                          // restart timer
 #endif
@@ -943,7 +918,7 @@ ISR(CC1100_INTVECT)
 
   ///////////////////////
   // http://www.nongnu.org/avr-libc/user-manual/FAQ.html#faq_intbits
-#ifndef USE_HAL
+#ifndef ARM
   TIFR1 = _BV(OCF1A);                 // clear Timers flags (?, important!)
 #endif
 
@@ -951,22 +926,22 @@ ISR(CC1100_INTVECT)
     if (b->state == STATE_MC) {
 retry_mc:
         // Edge is not too long, nor too short?
-		if (lowtime[CC_INSTANCE] < (b->clockTime >> 1) || lowtime[CC_INSTANCE] > (b->clockTime << 1) + b->clockTime) { // read as: duration < 0.5 * clockTime || duration > 3 * clockTime
+		if (lowtime < (b->clockTime >> 1) || lowtime > (b->clockTime << 1) + b->clockTime) { // read as: duration < 0.5 * clockTime || duration > 3 * clockTime
         //if (lowtime < (b->clockTime >> 1) || lowtime > (b->clockTime << 2)) {
 			// Fail. Abort.
 			//DC('#');
 			b->state = STATE_SYNC;
 		} else {
 		    // Only process every second half bit, i.e. every whole bit.
-		    if (lowtime[CC_INSTANCE]+(b->clockTime) > ((b->zero.lowtime+b->one.lowtime)>>1)) {
-                b->one.lowtime = makeavg(b->one.lowtime,lowtime[CC_INSTANCE]);
-                if (b->clockTime>lowtime[CC_INSTANCE]-10 && b->clockTime<lowtime[CC_INSTANCE]+10) {
+		    if (lowtime+(b->clockTime) > ((b->zero.lowtime+b->one.lowtime)>>1)) { 
+                b->one.lowtime = makeavg(b->one.lowtime,lowtime);
+                if (b->clockTime>lowtime-10 && b->clockTime<lowtime+10) {
                     count_half+=1;
                 } else {
                     count_half+=2;
                 }
             } else {
-                b->zero.lowtime = makeavg(b->zero.lowtime,lowtime[CC_INSTANCE]);
+                b->zero.lowtime = makeavg(b->zero.lowtime,lowtime);
                 count_half+=1;
             }
             if (count_half&1) { // ungerade
@@ -997,62 +972,62 @@ retry_sync:
     b->bitidx  = 7;
     b->data[0] = 0;
 #ifdef HAS_REVOLT
-      if (is_revolt(b, &hightime[CC_INSTANCE], &lowtime[CC_INSTANCE])) {
-        b->syncbit.hightime=hightime[CC_INSTANCE];
-        b->syncbit.lowtime=lowtime[CC_INSTANCE];
+      if (is_revolt(b, &hightime, &lowtime)) {
+        b->syncbit.hightime=hightime;
+        b->syncbit.lowtime=lowtime;
         return;
       } 
 #endif    
 #if defined(HAS_IT) || defined(HAS_TCM97001) 
-    b->syncbit.hightime=hightime[CC_INSTANCE];
-    b->syncbit.lowtime=lowtime[CC_INSTANCE];
-    if (IS433MHZ && (hightime[CC_INSTANCE] < TSCALE(840) && hightime[CC_INSTANCE] > TSCALE(145)) &&
-				         (lowtime[CC_INSTANCE]  < TSCALE(14000) && lowtime[CC_INSTANCE] > TSCALE(3200)) ) {
+    b->syncbit.hightime=hightime;
+    b->syncbit.lowtime=lowtime;
+    if (IS433MHZ && (hightime < TSCALE(840) && hightime > TSCALE(145)) &&
+				         (lowtime  < TSCALE(14000) && lowtime > TSCALE(3200)) ) {
 	   	  // sync bit received
           b->state = STATE_SYNC_PACKAGE;
           b->sync  = 1;
 	    #ifdef SAM7
           uint32_t ocrVal = 0;
-          ocrVal = ((lowtime[CC_INSTANCE] * 100) / 266);
-          HAL_timer_set_reload_register(CC_INSTANCE,(ocrVal - 16) * 16);
+          ocrVal = ((lowtime * 100) / 266);
+          HAL_TIMER_SET_RELOAD_REGISTER((ocrVal - 16) * 16);
       #elif defined STM32
-          HAL_timer_set_reload_register(CC_INSTANCE,(lowtime[CC_INSTANCE] - 16) * 16); //End of message
+          HAL_TIMER_SET_RELOAD_REGISTER((lowtime - 16) * 16); //End of message
       #else
-          OCR1A = (lowtime[CC_INSTANCE] - 16) * 16; //End of message
+          OCR1A = (lowtime - 16) * 16; //End of message
          	//OCR1A = 2200; // end of message
           //OCR1A = b->syncbit.lowtime*16 - 1000;
       #endif
-      #ifdef USE_HAL
-          hal_enable_CC_timer_int(CC_INSTANCE,TRUE);
+      #ifdef ARM
+          hal_enable_CC_timer_int(TRUE);
       #else
           TIMSK1 = _BV(OCIE1A);
       #endif
       return;
     }
 #endif
-        if(hightime[CC_INSTANCE] > TSCALE(1600) || lowtime[CC_INSTANCE] > TSCALE(1600)) {
+        if(hightime > TSCALE(1600) || lowtime > TSCALE(1600)) {
              // Invalid Package
             return;
         }
      /*   DNL();
         DC('R');
      */
-      b->zero.hightime = hightime[CC_INSTANCE];
-      b->zero.lowtime = lowtime[CC_INSTANCE];
+      b->zero.hightime = hightime;
+      b->zero.lowtime = lowtime;
       b->sync  = 1;
       b->state = STATE_SYNC;
 #ifdef HAS_MANCHESTER
-      if (IS433MHZ && ((hightime[CC_INSTANCE]>lowtime[CC_INSTANCE]-10 && hightime[CC_INSTANCE]<lowtime[CC_INSTANCE]+10)
-         || (hightime[CC_INSTANCE]>lowtime[CC_INSTANCE]*2-10 && hightime[CC_INSTANCE]<lowtime[CC_INSTANCE]*2+10)
-         || (hightime[CC_INSTANCE]>lowtime[CC_INSTANCE]/2-10 && hightime[CC_INSTANCE]<lowtime[CC_INSTANCE]/2+10))) {
+      if (IS433MHZ && ((hightime>lowtime-10 && hightime<lowtime+10)
+         || (hightime>lowtime*2-10 && hightime<lowtime*2+10)
+         || (hightime>lowtime/2-10 && hightime<lowtime/2+10))) {
         b->state = STATE_MC;
         
         // Automatic clock detection. One clock-period is half the duration of the first edge.
-        b->clockTime = (hightime[CC_INSTANCE] >> 1);
+        b->clockTime = (hightime >> 1);
         count_half=1;
         if (b->clockTime < TSCALE(300)) {
             // If clock time is lower than 300, than it should be an Oregon3
-            b->clockTime = hightime[CC_INSTANCE];
+            b->clockTime = hightime;
         }
 
         // Some sanity checking, very short (<200us) or very long (>1000us) signals are ignored.
@@ -1061,19 +1036,19 @@ retry_sync:
             //DC('s');
         }
         #ifdef SAM7
-        HAL_timer_set_reload_register(CC_INSTANCE,SILENCE/8*3);
+        HAL_TIMER_SET_RELOAD_REGISTER(SILENCE/8*3);
         #elif defined STM32
-            HAL_timer_set_reload_register(CC_INSTANCE,SILENCE);
+            HAL_TIMER_SET_RELOAD_REGISTER(SILENCE);
         #else
             OCR1A = SILENCE;
         #endif
-        #ifdef USE_HAL
-            hal_enable_CC_timer_int(CC_INSTANCE,TRUE);
+        #ifdef ARM
+            hal_enable_CC_timer_int(TRUE);
         #else
             TIMSK1 = _BV(OCIE1A);
         #endif
-        b->one.lowtime = lowtime[CC_INSTANCE];
-        b->one.hightime = hightime[CC_INSTANCE];
+        b->one.lowtime = lowtime;
+        b->one.hightime = hightime;
         addbit(b,1);
         
         goto retry_mc;
@@ -1081,16 +1056,16 @@ retry_sync:
 #endif
       break;
     case STATE_SYNC:  // sync: lots of zeroes
-      if(wave_equals(&b->zero, hightime[CC_INSTANCE], lowtime[CC_INSTANCE], b->state)) {
-        b->zero.hightime = makeavg(b->zero.hightime, hightime[CC_INSTANCE]);
-        b->zero.lowtime  = makeavg(b->zero.lowtime,  lowtime[CC_INSTANCE]);
+      if(wave_equals(&b->zero, hightime, lowtime, b->state)) {
+        b->zero.hightime = makeavg(b->zero.hightime, hightime);
+        b->zero.lowtime  = makeavg(b->zero.lowtime,  lowtime);
         b->clockTime = 0;
         b->sync++;
       } else if(b->sync >= 4 ) {          // the one bit at the end of the 0-sync
 #ifdef SAM7
-        HAL_timer_set_reload_register(CC_INSTANCE,SILENCE/8*3);
+        HAL_TIMER_SET_RELOAD_REGISTER(SILENCE/8*3);
 #elif defined STM32
-      	HAL_timer_set_reload_register(CC_INSTANCE,SILENCE);
+      	HAL_TIMER_SET_RELOAD_REGISTER(SILENCE);
 #else
         OCR1A = SILENCE;
 #endif
@@ -1105,9 +1080,9 @@ retry_sync:
           b->state = STATE_ESA;
           //DU(b->sync,         3);
 #ifdef SAM7
-          HAL_timer_set_reload_register(CC_INSTANCE,375);
+          HAL_TIMER_SET_RELOAD_REGISTER(375);
 #elif defined STM32
-          HAL_timer_set_reload_register(CC_INSTANCE,1000);
+          HAL_TIMER_SET_RELOAD_REGISTER(1000);
 #else
           OCR1A = 1000;
 #endif
@@ -1118,7 +1093,7 @@ retry_sync:
         
   #ifdef HAS_RF_ROUTER
           if(rf_router_myid &&
-                  check_rf_sync(hightime[CC_INSTANCE], lowtime[CC_INSTANCE]) &&
+                  check_rf_sync(hightime, lowtime) &&
                   check_rf_sync(b->zero.lowtime, b->zero.hightime)) {
           rf_router_status = RF_ROUTER_SYNC_RCVD;
           reset_input();
@@ -1131,14 +1106,14 @@ retry_sync:
           b->state = STATE_COLLECT;
         }
 
-        b->one.hightime = hightime[CC_INSTANCE];
-        b->one.lowtime  = lowtime[CC_INSTANCE];
+        b->one.hightime = hightime;
+        b->one.lowtime  = lowtime;
         b->byteidx = 0;
         b->bitidx  = 7;
         b->data[0] = 0;
 
-#ifdef USE_HAL
-        hal_enable_CC_timer_int(CC_INSTANCE,TRUE);
+#ifdef ARM
+        hal_enable_CC_timer_int(TRUE);
 #else
         TIMSK1 = _BV(OCIE1A);             // On timeout analyze the data
 #endif
@@ -1157,46 +1132,46 @@ retry_sync:
       break;*/
 #if defined(HAS_IT) || defined(HAS_TCM97001) 
     case STATE_SYNC_PACKAGE:
-      if (lowtime[CC_INSTANCE] < TSCALE(5500)) {
+      if (lowtime < TSCALE(5500)) {
 #ifdef HAS_MANCHESTER      
-    	if (hightime[CC_INSTANCE]>lowtime[CC_INSTANCE]-10 && hightime[CC_INSTANCE]<lowtime[CC_INSTANCE]+10 && b->valCount < 1) {
+    	if (hightime>lowtime-10 && hightime<lowtime+10 && b->valCount < 1) {
 		  // Wrong message, seams to be a Oregon Sync package
 		  b->state = STATE_RESET;
 		  goto retry_sync;
 		}
 #endif
 
-        calcOcrValue(b, &hightime[CC_INSTANCE], &lowtime[CC_INSTANCE], false);
+        calcOcrValue(b, &hightime, &lowtime, false);
         
         if (b->valCount == 0) {
-          b->zero.hightime=hightime[CC_INSTANCE];
-          b->zero.lowtime=lowtime[CC_INSTANCE];
+          b->zero.hightime=hightime;
+          b->zero.lowtime=lowtime;
         } 
-        if (lowtime[CC_INSTANCE] < TSCALE(1800) && b->syncbit.lowtime > TSCALE(4500)) {
+        if (lowtime < TSCALE(1800) && b->syncbit.lowtime > TSCALE(4500)) { 
             // IT
-            if (hightime[CC_INSTANCE] + TDIFF > lowtime[CC_INSTANCE]) {
+            if (hightime + TDIFF > lowtime) {
                 addbit(b, 0);
-                b->one.hightime=hightime[CC_INSTANCE];
-                b->one.lowtime=lowtime[CC_INSTANCE];
+                b->one.hightime=hightime;
+                b->one.lowtime=lowtime;
             } else {
                 addbit(b, 1);
-                b->two.hightime=hightime[CC_INSTANCE];
-                b->two.lowtime=lowtime[CC_INSTANCE];
+                b->two.hightime=hightime;
+                b->two.lowtime=lowtime;
             }
         } else {
           // TCM
-          if (lowtime[CC_INSTANCE] < TSCALE(2500) && b->syncbit.lowtime > TSCALE(5000)) {
+          if (lowtime < TSCALE(2500) && b->syncbit.lowtime > TSCALE(5000)) {
               addbit(b, 0);
-              b->two.hightime=hightime[CC_INSTANCE];
-              b->two.lowtime=lowtime[CC_INSTANCE];
-          } else if (lowtime[CC_INSTANCE] < TSCALE(1500) && b->syncbit.lowtime < TSCALE(5000)) {
+              b->two.hightime=hightime;
+              b->two.lowtime=lowtime;
+          } else if (lowtime < TSCALE(1500) && b->syncbit.lowtime < TSCALE(5000)) {
               addbit(b, 0);
-              b->two.hightime=hightime[CC_INSTANCE];
-              b->two.lowtime=lowtime[CC_INSTANCE];
+              b->two.hightime=hightime;
+              b->two.lowtime=lowtime;
           } else {
               addbit(b, 1);
-              b->one.hightime=hightime[CC_INSTANCE];
-              b->one.lowtime=lowtime[CC_INSTANCE];
+              b->one.hightime=hightime;
+              b->one.lowtime=lowtime;
           }
         }
       }
@@ -1204,35 +1179,35 @@ retry_sync:
 #endif
 #ifdef HAS_REVOLT
     case STATE_REVOLT: //STATE_REVOLTT
-      //calcOcrValue(b, &hightime[CC_INSTANCE], &lowtime[CC_INSTANCE], true);
-      addbit_revolt(b, &hightime[CC_INSTANCE], &lowtime[CC_INSTANCE]);
+      //calcOcrValue(b, &hightime, &lowtime, true);
+      addbit_revolt(b, &hightime, &lowtime);
       break;
 #endif
 
     default:
       /* TODO: Receive other sync packages
       if (b->state == STATE_COLLECT) {
-        DU(hightime[CC_INSTANCE]*16, 5);
+        DU(hightime*16, 5);
         DC(':');
-        DU(lowtime[CC_INSTANCE] *16, 5);
+        DU(lowtime *16, 5);
         DC(',');
       }*/
-      if(wave_equals(&b->one, hightime[CC_INSTANCE], lowtime[CC_INSTANCE], b->state)) {
+      if(wave_equals(&b->one, hightime, lowtime, b->state)) {
         addbit(b, 1);
-        b->one.hightime = makeavg(b->one.hightime, hightime[CC_INSTANCE]);
-        b->one.lowtime  = makeavg(b->one.lowtime,  lowtime[CC_INSTANCE]);
-      } else if(wave_equals(&b->zero, hightime[CC_INSTANCE], lowtime[CC_INSTANCE], b->state)) {
+        b->one.hightime = makeavg(b->one.hightime, hightime);
+        b->one.lowtime  = makeavg(b->one.lowtime,  lowtime);
+      } else if(wave_equals(&b->zero, hightime, lowtime, b->state)) {
       //} else {
         addbit(b, 0);
-        b->zero.hightime = makeavg(b->zero.hightime, hightime[CC_INSTANCE]);
-        b->zero.lowtime  = makeavg(b->zero.lowtime,  lowtime[CC_INSTANCE]);
+        b->zero.hightime = makeavg(b->zero.hightime, hightime);
+        b->zero.lowtime  = makeavg(b->zero.lowtime,  lowtime);
      /* TODO: Receive other sync packages
-      } else if(hightime[CC_INSTANCE] > lowtime[CC_INSTANCE]) {
+      } else if(hightime > lowtime) {
         addbit(b, 1);*/
       } else {
       /*  addbit(b, 0);*/
-      /*  b->two.hightime = makeavg(b->zero.hightime, hightime[CC_INSTANCE]);
-        b->two.lowtime  = makeavg(b->zero.lowtime,  lowtime[CC_INSTANCE]);*/
+      /*  b->two.hightime = makeavg(b->zero.hightime, hightime);
+        b->two.lowtime  = makeavg(b->zero.lowtime,  lowtime);*/
         reset_input();
       }
       break;
@@ -1243,7 +1218,7 @@ retry_sync:
 uint8_t
 rf_isreceiving()
 {
-  uint8_t r = (bucket_array[CC_INSTANCE][bucket_in[CC_INSTANCE]].state != STATE_RESET);
+  uint8_t r = (bucket_array[bucket_in].state != STATE_RESET);
 #ifdef HAS_FHT_80b
   r = (r || fht80b_timeout != FHT_TIMER_DISABLED);
 #endif
