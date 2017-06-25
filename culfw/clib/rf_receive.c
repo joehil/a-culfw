@@ -21,7 +21,8 @@
  * 51 Franklin St, Fifth Floor, Boston, MA 02110, USA
  *
  * joehil 2017-06-16: Modification to report all TCM97001 packages
- */
+ * joehil 2017-06-25: Modification implement deduplication for TCM97001 packages
+  */
 #include <avr/interrupt.h>              // for ISR
 #include <avr/pgmspace.h>               // for PSTR
 #include <stdbool.h>                    // for bool, false
@@ -90,6 +91,7 @@ static uint8_t bucket_out;                // Pointer to the out (analyze) queue
 static uint8_t bucket_nrused;             // Number of unprocessed buckets
 static uint8_t nibble; // parity-stripped output
 static uint8_t roby, robuf[MAXMSG];       // for Repeat check: buffer and time
+static uint8_t qoby, qobuf[MAXMSG];       // for TCM Repeat check: buffer
 static uint32_t reptime;
 static uint16_t maxLevel;
 
@@ -318,6 +320,9 @@ RfAnalyze_Task(void)
   uint8_t datatype = 0;
   bucket_t *b;
   uint8_t oby = 0;
+#if defined(HAS_TCM97001)
+  uint8_t tcm_rep = 0;
+#endif
 
   if(lowtime) {
 #ifndef NO_RF_DEBUG
@@ -437,6 +442,9 @@ RfAnalyze_Task(void)
 
   if(datatype && (tx_report & REP_KNOWN)) {
 
+#if defined(HAS_TCM97001)
+    tcm_rep = 1;
+#endif
     packetCheckValues.isrep = 0;
     packetCheckValues.packageOK = 0;
     //packetCheckValues.isnotrep = 0;
@@ -453,6 +461,30 @@ RfAnalyze_Task(void)
           packetCheckValues.isrep = 1;
       }
 
+#if defined(HAS_TCM97001)
+      if(datatype == TYPE_TCM97001) {
+        if(oby>4) {
+          for(roby = 0; roby < 4; roby++) {
+            if(robuf[roby] != obuf[roby]) {
+              break;
+            }
+    	  }
+        }
+        if(oby>4) {
+          for(qoby = 0; qoby < 4; qoby++) {
+            if(qobuf[qoby] != obuf[qoby]) {
+	      break;
+            }
+    	  }
+        }
+        if((roby < 3)&&(qoby < 3)) tcm_rep=0;
+      }
+#endif
+
+#if defined(HAS_TCM97001)
+      for(qoby = 0; qoby < 4; qoby++)
+      qobuf[qoby] = robuf[qoby];
+#endif
       // save the data
       for(roby = 0; roby < oby; roby++)
         robuf[roby] = obuf[roby];
@@ -470,9 +502,13 @@ RfAnalyze_Task(void)
 
     checkForRepeatedPackage(&datatype, b);
 
-#if defined(HAS_IT) || defined(HAS_TCM97001)
-    if(datatype == TYPE_TCM97001) 
-    	packetCheckValues.packageOK = 1;
+#if defined(HAS_TCM97001)
+    if(datatype == TYPE_TCM97001) {
+	if (tcm_rep == 0)
+    		packetCheckValues.packageOK = 1;
+	else
+		packetCheckValues.packageOK = 0;	
+    }
 #endif
 
 #if defined(HAS_RF_ROUTER) && defined(HAS_FHT_80b)
